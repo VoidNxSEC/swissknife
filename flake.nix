@@ -36,6 +36,12 @@
           gsettings-desktop-schemas
           hicolor-icon-theme
           adwaita-icon-theme
+          graphene
+          glib
+          pango
+          cairo
+          gdk-pixbuf
+          harfbuzz
         ];
 
         # Wrapper for GTK4 applications
