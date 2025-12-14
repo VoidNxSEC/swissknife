@@ -17,7 +17,7 @@
           requests
           psutil
           dbus-python
-          systemd
+          systemd-python
         ]);
 
         # Core script builder
