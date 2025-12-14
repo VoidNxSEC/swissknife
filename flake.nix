@@ -11,64 +11,69 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # Python environment with all dependencies for TUI SOC
+        # Python environment with GTK4/Adwaita for GUI
         pythonEnv = pkgs.python313.withPackages (ps: with ps; [
-          # Core TUI
-          textual
-          rich
-
-          # Async & Network
-          aiohttp
-          requests
+          # GTK4
+          pygobject3
 
           # System monitoring
           psutil
-          dbus-python
-          systemd-python
 
-          # Optional: ML/AI
-          # ollama  # Use API instead
+          # Network/API
+          requests
+          aiohttp
+
+          # Core
+          rich
+          dbus-python
         ]);
 
-        # GTK4 environment for systray
-        gtkEnv = with pkgs; [
+        # GTK4/Adwaita runtime dependencies
+        gtkDeps = with pkgs; [
           gtk4
-          libappindicator-gtk3
+          libadwaita
           gobject-introspection
+          gsettings-desktop-schemas
+          hicolor-icon-theme
+          adwaita-icon-theme
         ];
 
-        # Core tool builder with proper shebang
-        mkTool = name: src: pkgs.writeScriptBin name ''
+        # Wrapper for GTK4 applications
+        wrapGtkApp = name: script: pkgs.writeShellScriptBin name ''
+          export GI_TYPELIB_PATH="${pkgs.lib.makeSearchPath "lib/girepository-1.0" gtkDeps}"
+          export XDG_DATA_DIRS="${pkgs.lib.makeSearchPath "share" gtkDeps}:$XDG_DATA_DIRS"
+          export GDK_BACKEND=wayland,x11
+          exec ${pythonEnv}/bin/python ${script} "$@"
+        '';
+
+        # Terminal-based tools
+        mkTerminalTool = name: src: pkgs.writeScriptBin name ''
           #!${pythonEnv}/bin/python
           import sys
           sys.path.insert(0, "${./src}")
-
-          # Execute the source file
           with open("${src}") as f:
               exec(compile(f.read(), "${src}", "exec"))
-        '';
-
-        # Systray indicator script
-        systrayScript = pkgs.writeScriptBin "swiss-systray" ''
-          #!${pkgs.python313.withPackages (ps: with ps; [ pygobject3 ])}/bin/python
-          ${builtins.readFile ./src/systray.py}
         '';
 
       in
       {
         packages = {
-          swiss-rebuild = mkTool "swiss-rebuild" ./src/rebuild_forensics.py;
-          swiss-doctor = mkTool "swiss-doctor" ./src/service_doctor.py;
-          swiss-monitor = mkTool "swiss-monitor" ./src/ml_monitor.py;
-          swiss-systray = systrayScript;
+          # GTK4 GUI applications
+          swiss-monitor = wrapGtkApp "swiss-monitor" ./src/ml_monitor.py;
+          swiss-systray = wrapGtkApp "swiss-systray" ./src/systray.py;
+
+          # Terminal tools
+          swiss-rebuild = mkTerminalTool "swiss-rebuild" ./src/rebuild_forensics.py;
+          swiss-doctor = mkTerminalTool "swiss-doctor" ./src/service_doctor.py;
+
           default = self.packages.${system}.swiss-monitor;
         };
 
         apps = {
-          swiss-rebuild = flake-utils.lib.mkApp { drv = self.packages.${system}.swiss-rebuild; };
-          swiss-doctor = flake-utils.lib.mkApp { drv = self.packages.${system}.swiss-doctor; };
           swiss-monitor = flake-utils.lib.mkApp { drv = self.packages.${system}.swiss-monitor; };
           swiss-systray = flake-utils.lib.mkApp { drv = self.packages.${system}.swiss-systray; };
+          swiss-rebuild = flake-utils.lib.mkApp { drv = self.packages.${system}.swiss-rebuild; };
+          swiss-doctor = flake-utils.lib.mkApp { drv = self.packages.${system}.swiss-doctor; };
           default = self.apps.${system}.swiss-monitor;
         };
 
@@ -78,13 +83,17 @@
             pkgs.black
             pkgs.mypy
             pkgs.ruff
-          ] ++ gtkEnv;
+          ] ++ gtkDeps;
 
           shellHook = ''
-            echo "🇨🇭 Swissknife Development Environment"
+            export GI_TYPELIB_PATH="${pkgs.lib.makeSearchPath "lib/girepository-1.0" gtkDeps}"
+            export XDG_DATA_DIRS="${pkgs.lib.makeSearchPath "share" gtkDeps}:$XDG_DATA_DIRS"
+            export GDK_BACKEND=wayland,x11
+
+            echo "🇨🇭 Swissknife Development Environment (GTK4)"
             echo ""
             echo "Commands:"
-            echo "  python src/ml_monitor.py    - Run TUI SOC Monitor"
+            echo "  python src/ml_monitor.py    - Run GTK4 SOC Monitor"
             echo "  python src/systray.py       - Run Systray (Wayland)"
             echo "  python src/service_doctor.py - Run System Doctor"
             echo ""

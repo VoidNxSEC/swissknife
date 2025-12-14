@@ -1,53 +1,41 @@
 #!/usr/bin/env python3
 """
-Swiss Monitor TUI SOC - Security Operations Center Monitor
+Swiss Monitor GTK4 - Native SOC Monitor for Wayland
 
-A professional terminal UI for real-time security monitoring with:
+A professional GTK4/Adwaita application for real-time security monitoring:
+- Native Wayland integration
+- Glassmorphism styling with libadwaita
 - Real-time log streaming from journald, Suricata, FIM
 - LLM chat for emergency assistance (Ollama)
-- Glassmorphism styling for Hyprland
-- Keyboard shortcuts and actionable buttons
-- Alert severity classification
+- System tray integration
 
 Run: swiss-monitor
 """
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
 
 import asyncio
 import json
 import subprocess
 import sys
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
-import aiohttp
+from gi.repository import Adw, Gio, GLib, Gtk, Pango
 import psutil
-from textual import on, work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.css.query import NoMatches
-from textual.reactive import reactive
-from textual.widgets import (
-    Button,
-    DataTable,
-    Footer,
-    Header,
-    Input,
-    Label,
-    ListItem,
-    ListView,
-    Log,
-    Markdown,
-    ProgressBar,
-    RichLog,
-    Rule,
-    Static,
-    TabbedContent,
-    TabPane,
-)
+
+# Try to import aiohttp for LLM
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 
 
 class Severity(Enum):
@@ -74,349 +62,397 @@ class LogEvent:
     message: str
     severity: Severity = Severity.INFO
     category: str = ""
-    raw: dict = field(default_factory=dict)
 
 
-@dataclass
-class SystemStats:
-    """System resource statistics"""
-    cpu_percent: float = 0.0
-    memory_percent: float = 0.0
-    disk_percent: float = 0.0
-    swap_percent: float = 0.0
-    network_rx: int = 0
-    network_tx: int = 0
-    active_connections: int = 0
+class StatsWidget(Gtk.Box):
+    """System statistics widget"""
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.set_margin_top(12)
+        self.set_margin_bottom(12)
+        self.set_margin_start(12)
+        self.set_margin_end(12)
+
+        # Title
+        title = Gtk.Label(label="System Vitals")
+        title.add_css_class("title-4")
+        self.append(title)
+
+        # Stats grid
+        self.grid = Gtk.Grid()
+        self.grid.set_column_spacing(12)
+        self.grid.set_row_spacing(6)
+        self.append(self.grid)
+
+        # Create labels
+        self.cpu_label = self._add_stat_row("CPU:", 0)
+        self.mem_label = self._add_stat_row("RAM:", 1)
+        self.disk_label = self._add_stat_row("Disk:", 2)
+        self.swap_label = self._add_stat_row("Swap:", 3)
+        self.conns_label = self._add_stat_row("Connections:", 4)
+
+        # Progress bars
+        self.cpu_bar = self._add_progress_bar(0)
+        self.mem_bar = self._add_progress_bar(1)
+        self.disk_bar = self._add_progress_bar(2)
+        self.swap_bar = self._add_progress_bar(3)
+
+    def _add_stat_row(self, label: str, row: int) -> Gtk.Label:
+        name = Gtk.Label(label=label)
+        name.set_halign(Gtk.Align.START)
+        name.add_css_class("dim-label")
+        self.grid.attach(name, 0, row, 1, 1)
+
+        value = Gtk.Label(label="--")
+        value.set_halign(Gtk.Align.END)
+        value.set_hexpand(True)
+        self.grid.attach(value, 2, row, 1, 1)
+        return value
+
+    def _add_progress_bar(self, row: int) -> Gtk.LevelBar:
+        bar = Gtk.LevelBar()
+        bar.set_min_value(0)
+        bar.set_max_value(100)
+        bar.set_hexpand(True)
+        bar.set_size_request(100, -1)
+        self.grid.attach(bar, 1, row, 1, 1)
+        return bar
+
+    def update(self, cpu: float, mem: float, disk: float, swap: float, conns: int):
+        self.cpu_label.set_text(f"{cpu:.1f}%")
+        self.mem_label.set_text(f"{mem:.1f}%")
+        self.disk_label.set_text(f"{disk:.1f}%")
+        self.swap_label.set_text(f"{swap:.1f}%")
+        self.conns_label.set_text(str(conns))
+
+        self.cpu_bar.set_value(cpu)
+        self.mem_bar.set_value(mem)
+        self.disk_bar.set_value(disk)
+        self.swap_bar.set_value(swap)
 
 
-class StatsPanel(Static):
-    """System statistics panel with real-time updates"""
+class LogView(Gtk.ScrolledWindow):
+    """Scrollable log view with colored entries"""
 
-    stats = reactive(SystemStats())
+    def __init__(self, title: str = "Logs"):
+        super().__init__()
+        self.set_vexpand(True)
+        self.set_hexpand(True)
+        self.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
 
-    def compose(self) -> ComposeResult:
-        yield Static(id="stats-content")
+        # Main container
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_child(box)
 
-    def watch_stats(self, stats: SystemStats) -> None:
-        content = self.query_one("#stats-content", Static)
-        cpu_color = "green" if stats.cpu_percent < 50 else "yellow" if stats.cpu_percent < 80 else "red"
-        mem_color = "green" if stats.memory_percent < 60 else "yellow" if stats.memory_percent < 85 else "red"
+        # Title bar
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        header.add_css_class("toolbar")
+        header.set_margin_start(6)
+        header.set_margin_end(6)
 
-        text = f"""╭─── System Vitals ───╮
-│ CPU:  [{cpu_color}]{stats.cpu_percent:5.1f}%[/]        │
-│ RAM:  [{mem_color}]{stats.memory_percent:5.1f}%[/]        │
-│ Disk: {stats.disk_percent:5.1f}%         │
-│ Swap: {stats.swap_percent:5.1f}%         │
-├─── Network ─────────┤
-│ RX: {stats.network_rx / 1024 / 1024:6.1f} MB     │
-│ TX: {stats.network_tx / 1024 / 1024:6.1f} MB     │
-│ Conns: {stats.active_connections:4d}         │
-╰─────────────────────╯"""
-        content.update(text)
+        label = Gtk.Label(label=title)
+        label.add_css_class("heading")
+        header.append(label)
+        box.append(header)
 
+        # Log list
+        self.list_box = Gtk.ListBox()
+        self.list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list_box.add_css_class("rich-list")
+        box.append(self.list_box)
 
-class AlertsPanel(Static):
-    """Recent security alerts panel"""
+        self.max_entries = 200
 
-    alerts: reactive[list] = reactive(list)
+    def add_log(self, event: LogEvent):
+        """Add a log entry"""
+        row = Gtk.ListBoxRow()
+        row.set_activatable(False)
 
-    def compose(self) -> ComposeResult:
-        yield RichLog(id="alerts-log", highlight=True, markup=True, max_lines=100)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.set_margin_top(4)
+        box.set_margin_bottom(4)
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+        row.set_child(box)
 
-    def add_alert(self, event: LogEvent) -> None:
-        log = self.query_one("#alerts-log", RichLog)
+        # Severity icon
+        icon = Gtk.Label(label=event.severity.icon)
+        box.append(icon)
+
+        # Timestamp
         time_str = event.timestamp[11:19] if len(event.timestamp) > 11 else event.timestamp
-        log.write(
-            f"[{event.severity.color}]{event.severity.icon}[/] "
-            f"[dim]{time_str}[/] "
-            f"[cyan]{event.source}[/] "
-            f"{event.message[:80]}"
-        )
+        time_label = Gtk.Label(label=time_str)
+        time_label.add_css_class("dim-label")
+        time_label.add_css_class("monospace")
+        box.append(time_label)
 
+        # Source
+        source_label = Gtk.Label(label=f"[{event.source}]")
+        source_label.add_css_class("accent")
+        source_label.set_max_width_chars(20)
+        source_label.set_ellipsize(Pango.EllipsizeMode.END)
+        box.append(source_label)
 
-class ChatPanel(Static):
-    """LLM Chat panel for emergency assistance"""
+        # Message
+        msg_label = Gtk.Label(label=event.message)
+        msg_label.set_hexpand(True)
+        msg_label.set_halign(Gtk.Align.START)
+        msg_label.set_ellipsize(Pango.EllipsizeMode.END)
+        msg_label.set_max_width_chars(80)
+        box.append(msg_label)
 
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            ScrollableContainer(
-                RichLog(id="chat-log", highlight=True, markup=True, max_lines=500),
-                id="chat-scroll"
-            ),
-            Horizontal(
-                Input(placeholder="Ask about security events...", id="chat-input"),
-                Button("Send", id="chat-send", variant="primary"),
-                id="chat-controls"
-            ),
-            id="chat-container"
-        )
+        # Color based on severity
+        if event.severity == Severity.CRITICAL:
+            row.add_css_class("error")
+        elif event.severity == Severity.HIGH:
+            row.add_css_class("warning")
 
-    async def send_message(self, message: str) -> None:
-        chat_log = self.query_one("#chat-log", RichLog)
-        chat_log.write(f"[bold cyan]You:[/] {message}")
+        self.list_box.prepend(row)
 
-        # Call Ollama
-        try:
-            response = await self._call_ollama(message)
-            chat_log.write(f"[bold green]AI:[/] {response}")
-        except Exception as e:
-            chat_log.write(f"[bold red]Error:[/] {str(e)}")
+        # Limit entries
+        while len(list(self.list_box)) > self.max_entries:
+            last = self.list_box.get_row_at_index(self.max_entries)
+            if last:
+                self.list_box.remove(last)
 
-    async def _call_ollama(self, prompt: str) -> str:
-        """Call Ollama API for chat response"""
-        system_prompt = """You are a SOC (Security Operations Center) AI assistant.
-You help security analysts understand log events, identify threats, and respond to incidents.
-Be concise but thorough. Suggest actionable next steps when relevant."""
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "http://localhost:11434/api/chat",
-                json={
-                    "model": "llama3.2:3b",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "stream": False,
-                    "options": {"temperature": 0.7, "num_predict": 500}
-                },
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("message", {}).get("content", "No response")
-                else:
-                    return f"API error: {resp.status}"
-
-
-class LogsPanel(Static):
-    """Real-time logs streaming panel"""
-
-    def compose(self) -> ComposeResult:
-        yield RichLog(id="logs-stream", highlight=True, markup=True, max_lines=1000)
-
-    def add_log(self, event: LogEvent) -> None:
-        log = self.query_one("#logs-stream", RichLog)
-        time_str = event.timestamp[11:19] if len(event.timestamp) > 11 else event.timestamp
-        log.write(
-            f"[dim]{time_str}[/] "
-            f"[{event.severity.color}]{event.severity.icon}[/] "
-            f"[blue]{event.source}[/] "
-            f"{event.message}"
-        )
-
-
-class ActionsPanel(Static):
-    """Quick actions panel with buttons"""
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("⚡ Quick Actions", classes="panel-title"),
-            Rule(),
-            Button("🔍 Analyze Threats", id="btn-analyze", variant="primary"),
-            Button("🛡️ Check Suricata", id="btn-suricata"),
-            Button("📊 Generate Report", id="btn-report"),
-            Button("🔄 Reload Rules", id="btn-reload"),
-            Button("⚠️ Test Alert", id="btn-test"),
-            Rule(),
-            Button("🚨 EMERGENCY", id="btn-emergency", variant="error"),
-            id="actions-container"
-        )
-
-
-class SwissMonitorApp(App):
-    """Swiss Monitor TUI SOC Application"""
-
-    CSS = """
-    /* Glassmorphism-inspired theme for Hyprland */
-
-    Screen {
-        background: #0d1117;
-    }
-
-    Header {
-        background: #161b22;
-        color: #58a6ff;
-        text-style: bold;
-    }
-
-    Footer {
-        background: #161b22;
-    }
-
-    #main-container {
-        layout: grid;
-        grid-size: 3 2;
-        grid-columns: 1fr 2fr 1fr;
-        grid-rows: 1fr 1fr;
-        padding: 1;
-    }
-
-    #stats-panel {
-        row-span: 1;
-        border: solid #30363d;
-        background: #161b2280;
-        padding: 1;
-    }
-
-    #alerts-panel {
-        column-span: 2;
-        border: solid #f85149;
-        background: #161b2280;
-        padding: 1;
-    }
-
-    #logs-panel {
-        column-span: 2;
-        border: solid #30363d;
-        background: #161b2280;
-        padding: 1;
-    }
-
-    #actions-panel {
-        border: solid #238636;
-        background: #161b2280;
-        padding: 1;
-    }
-
-    #chat-panel {
-        border: solid #58a6ff;
-        background: #161b2280;
-        padding: 1;
-    }
-
-    .panel-title {
-        text-style: bold;
-        color: #58a6ff;
-    }
-
-    Button {
-        margin: 1 0;
-        width: 100%;
-    }
-
-    #btn-emergency {
-        background: #da3633;
-        margin-top: 2;
-    }
-
-    #chat-container {
-        height: 100%;
-    }
-
-    #chat-scroll {
-        height: 1fr;
-        border: solid #30363d;
-    }
-
-    #chat-controls {
-        height: 3;
-        margin-top: 1;
-    }
-
-    #chat-input {
-        width: 1fr;
-    }
-
-    #chat-send {
-        width: auto;
-    }
-
-    TabbedContent {
-        height: 100%;
-    }
-
-    TabPane {
-        padding: 1;
-    }
-
-    RichLog {
-        background: #0d111799;
-        scrollbar-background: #21262d;
-        scrollbar-color: #30363d;
-    }
-    """
-
-    TITLE = "🇨🇭 Swiss Monitor SOC"
-    SUB_TITLE = "Security Operations Center"
-
-    BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("f1", "focus_logs", "Logs"),
-        Binding("f2", "focus_alerts", "Alerts"),
-        Binding("f3", "focus_chat", "Chat"),
-        Binding("f5", "refresh", "Refresh"),
-        Binding("f10", "emergency", "EMERGENCY"),
-        Binding("ctrl+l", "clear_logs", "Clear"),
-    ]
-
-    def compose(self) -> ComposeResult:
-        yield Header()
-
-        with TabbedContent():
-            with TabPane("📊 Dashboard", id="tab-dashboard"):
-                with Container(id="main-container"):
-                    yield StatsPanel(id="stats-panel")
-                    yield AlertsPanel(id="alerts-panel")
-                    yield ActionsPanel(id="actions-panel")
-                    yield LogsPanel(id="logs-panel")
-
-            with TabPane("💬 AI Assistant", id="tab-chat"):
-                yield ChatPanel(id="chat-panel")
-
-            with TabPane("📈 Suricata", id="tab-suricata"):
-                yield RichLog(id="suricata-log", highlight=True, markup=True)
-
-            with TabPane("📁 FIM", id="tab-fim"):
-                yield RichLog(id="fim-log", highlight=True, markup=True)
-
-        yield Footer()
-
-    async def on_mount(self) -> None:
-        """Start background tasks when app mounts"""
-        self.run_worker(self._update_stats(), exclusive=True, name="stats")
-        self.run_worker(self._stream_journald(), exclusive=True, name="journald")
-        self.run_worker(self._stream_suricata(), exclusive=True, name="suricata")
-
-    @work(exclusive=True)
-    async def _update_stats(self) -> None:
-        """Update system stats periodically"""
-        net_io_start = psutil.net_io_counters()
+    def clear(self):
+        """Clear all logs"""
         while True:
-            try:
-                net_io = psutil.net_io_counters()
-                stats = SystemStats(
-                    cpu_percent=psutil.cpu_percent(interval=None),
-                    memory_percent=psutil.virtual_memory().percent,
-                    disk_percent=psutil.disk_usage('/').percent,
-                    swap_percent=psutil.swap_memory().percent,
-                    network_rx=net_io.bytes_recv - net_io_start.bytes_recv,
-                    network_tx=net_io.bytes_sent - net_io_start.bytes_sent,
-                    active_connections=len(psutil.net_connections())
-                )
-                try:
-                    panel = self.query_one("#stats-panel", StatsPanel)
-                    panel.stats = stats
-                except NoMatches:
-                    pass
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-
-    @work(exclusive=True)
-    async def _stream_journald(self) -> None:
-        """Stream logs from journald"""
-        proc = await asyncio.create_subprocess_exec(
-            "journalctl", "-f", "-o", "json", "-p", "notice",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
+            row = self.list_box.get_row_at_index(0)
+            if row:
+                self.list_box.remove(row)
+            else:
                 break
 
+
+class ChatWidget(Gtk.Box):
+    """LLM Chat widget for emergency assistance"""
+
+    def __init__(self, on_send: Callable[[str], None]):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.set_margin_top(8)
+        self.set_margin_bottom(8)
+        self.set_margin_start(8)
+        self.set_margin_end(8)
+
+        self.on_send = on_send
+
+        # Chat history
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.append(scroll)
+
+        self.chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scroll.set_child(self.chat_box)
+
+        # Input area
+        input_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.append(input_box)
+
+        self.entry = Gtk.Entry()
+        self.entry.set_placeholder_text("Ask about security events...")
+        self.entry.set_hexpand(True)
+        self.entry.connect("activate", self._on_send)
+        input_box.append(self.entry)
+
+        send_btn = Gtk.Button(label="Send")
+        send_btn.add_css_class("suggested-action")
+        send_btn.connect("clicked", self._on_send)
+        input_box.append(send_btn)
+
+    def _on_send(self, _widget):
+        text = self.entry.get_text().strip()
+        if text:
+            self.add_message("You", text, is_user=True)
+            self.entry.set_text("")
+            self.on_send(text)
+
+    def add_message(self, sender: str, message: str, is_user: bool = False):
+        """Add a chat message"""
+        frame = Gtk.Frame()
+        frame.set_margin_top(4)
+        frame.set_margin_bottom(4)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+        frame.set_child(box)
+
+        # Sender
+        sender_label = Gtk.Label(label=sender)
+        sender_label.set_halign(Gtk.Align.START)
+        sender_label.add_css_class("heading")
+        if is_user:
+            sender_label.add_css_class("accent")
+        box.append(sender_label)
+
+        # Message
+        msg_label = Gtk.Label(label=message)
+        msg_label.set_halign(Gtk.Align.START)
+        msg_label.set_wrap(True)
+        msg_label.set_max_width_chars(60)
+        box.append(msg_label)
+
+        self.chat_box.append(frame)
+
+
+class ActionsWidget(Gtk.Box):
+    """Quick actions panel"""
+
+    def __init__(self, on_action: Callable[[str], None]):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.set_margin_top(12)
+        self.set_margin_bottom(12)
+        self.set_margin_start(12)
+        self.set_margin_end(12)
+
+        self.on_action = on_action
+
+        # Title
+        title = Gtk.Label(label="⚡ Quick Actions")
+        title.add_css_class("title-4")
+        self.append(title)
+
+        # Buttons
+        self._add_button("🔍 Analyze Threats", "analyze", "suggested-action")
+        self._add_button("🛡️ Check Suricata", "suricata")
+        self._add_button("📊 System Status", "status")
+        self._add_button("🔄 Refresh", "refresh")
+        self._add_button("🧹 Clear Logs", "clear")
+
+        # Spacer
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        self.append(spacer)
+
+        # Emergency button
+        emergency = Gtk.Button(label="🚨 EMERGENCY")
+        emergency.add_css_class("destructive-action")
+        emergency.connect("clicked", lambda _: self.on_action("emergency"))
+        self.append(emergency)
+
+    def _add_button(self, label: str, action: str, css_class: str = None):
+        btn = Gtk.Button(label=label)
+        if css_class:
+            btn.add_css_class(css_class)
+        btn.connect("clicked", lambda _: self.on_action(action))
+        self.append(btn)
+
+
+class SwissMonitorWindow(Adw.ApplicationWindow):
+    """Main window"""
+
+    def __init__(self, app: Adw.Application):
+        super().__init__(application=app)
+
+        self.set_title("🇨🇭 Swiss Monitor SOC")
+        self.set_default_size(1200, 800)
+
+        # Main layout
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_content(self.main_box)
+
+        # Header bar
+        header = Adw.HeaderBar()
+        self.main_box.append(header)
+
+        # Title
+        title = Adw.WindowTitle(title="🇨🇭 Swiss Monitor", subtitle="Security Operations Center")
+        header.set_title_widget(title)
+
+        # View switcher
+        self.stack = Adw.ViewStack()
+
+        switcher = Adw.ViewSwitcher()
+        switcher.set_stack(self.stack)
+        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(switcher)
+
+        # Content
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        content.set_hexpand(True)
+        content.set_vexpand(True)
+        self.main_box.append(content)
+
+        # Left sidebar - Stats
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sidebar.set_size_request(250, -1)
+        sidebar.add_css_class("sidebar")
+        content.append(sidebar)
+
+        self.stats = StatsWidget()
+        sidebar.append(self.stats)
+
+        self.actions = ActionsWidget(self._on_action)
+        sidebar.append(self.actions)
+
+        # Separator
+        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        content.append(sep)
+
+        # Main content area with tabs
+        content.append(self.stack)
+        self.stack.set_hexpand(True)
+        self.stack.set_vexpand(True)
+
+        # Dashboard tab
+        dashboard = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        self.stack.add_titled(dashboard, "dashboard", "📊 Dashboard")
+
+        self.logs_view = LogView("System Logs")
+        dashboard.set_start_child(self.logs_view)
+
+        self.alerts_view = LogView("Security Alerts")
+        self.alerts_view.add_css_class("error")
+        dashboard.set_end_child(self.alerts_view)
+        dashboard.set_position(400)
+
+        # Chat tab
+        self.chat = ChatWidget(self._on_chat_send)
+        self.stack.add_titled(self.chat, "chat", "💬 AI Assistant")
+
+        # Suricata tab
+        self.suricata_view = LogView("Suricata IDS")
+        self.stack.add_titled(self.suricata_view, "suricata", "📈 Suricata")
+
+        # Start background threads
+        self._start_monitoring()
+
+    def _start_monitoring(self):
+        """Start background monitoring threads"""
+        threading.Thread(target=self._stats_loop, daemon=True).start()
+        threading.Thread(target=self._journald_loop, daemon=True).start()
+        threading.Thread(target=self._suricata_loop, daemon=True).start()
+
+    def _stats_loop(self):
+        """Update stats periodically"""
+        import time
+        while True:
+            try:
+                cpu = psutil.cpu_percent(interval=None)
+                mem = psutil.virtual_memory().percent
+                disk = psutil.disk_usage('/').percent
+                swap = psutil.swap_memory().percent
+                conns = len(psutil.net_connections())
+
+                GLib.idle_add(self.stats.update, cpu, mem, disk, swap, conns)
+            except Exception:
+                pass
+            time.sleep(2)
+
+    def _journald_loop(self):
+        """Stream logs from journald"""
+        proc = subprocess.Popen(
+            ["journalctl", "-f", "-o", "json", "-p", "notice"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+
+        for line in proc.stdout:
             try:
                 data = json.loads(line.decode())
                 priority = int(data.get("PRIORITY", 6))
@@ -441,157 +477,130 @@ class SwissMonitorApp(App):
                     severity=severity
                 )
 
-                try:
-                    logs_panel = self.query_one("#logs-panel", LogsPanel)
-                    logs_panel.add_log(event)
+                GLib.idle_add(self.logs_view.add_log, event)
 
-                    if severity in (Severity.CRITICAL, Severity.HIGH):
-                        alerts_panel = self.query_one("#alerts-panel", AlertsPanel)
-                        alerts_panel.add_alert(event)
-                except NoMatches:
-                    pass
+                if severity in (Severity.CRITICAL, Severity.HIGH):
+                    GLib.idle_add(self.alerts_view.add_log, event)
 
             except (json.JSONDecodeError, ValueError):
                 continue
 
-    @work(exclusive=True)
-    async def _stream_suricata(self) -> None:
-        """Stream Suricata EVE JSON logs"""
+    def _suricata_loop(self):
+        """Stream Suricata EVE logs"""
         eve_path = Path("/var/log/suricata/eve.json")
         if not eve_path.exists():
             return
 
-        proc = await asyncio.create_subprocess_exec(
-            "tail", "-f", "-n", "0", str(eve_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
+        proc = subprocess.Popen(
+            ["tail", "-f", "-n", "0", str(eve_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
         )
 
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-
+        for line in proc.stdout:
             try:
                 data = json.loads(line.decode())
-                event_type = data.get("event_type", "unknown")
-
-                if event_type == "alert":
+                if data.get("event_type") == "alert":
                     alert = data.get("alert", {})
                     severity_map = {1: Severity.CRITICAL, 2: Severity.HIGH, 3: Severity.MEDIUM}
                     severity = severity_map.get(alert.get("severity", 3), Severity.LOW)
 
                     event = LogEvent(
                         timestamp=data.get("timestamp", ""),
-                        source=f"suricata:{event_type}",
+                        source="suricata",
                         message=alert.get("signature", "Unknown alert"),
                         severity=severity,
                         category=alert.get("category", "")
                     )
 
-                    try:
-                        alerts_panel = self.query_one("#alerts-panel", AlertsPanel)
-                        alerts_panel.add_alert(event)
-
-                        suricata_log = self.query_one("#suricata-log", RichLog)
-                        suricata_log.write(
-                            f"[{severity.color}]{severity.icon}[/] "
-                            f"[dim]{event.timestamp}[/] "
-                            f"{event.message}"
-                        )
-                    except NoMatches:
-                        pass
+                    GLib.idle_add(self.alerts_view.add_log, event)
+                    GLib.idle_add(self.suricata_view.add_log, event)
 
             except (json.JSONDecodeError, ValueError):
                 continue
 
-    @on(Button.Pressed, "#chat-send")
-    async def handle_chat_send(self) -> None:
-        """Handle chat send button"""
-        try:
-            chat_input = self.query_one("#chat-input", Input)
-            message = chat_input.value.strip()
-            if message:
-                chat_panel = self.query_one("#chat-panel", ChatPanel)
-                await chat_panel.send_message(message)
-                chat_input.value = ""
-        except NoMatches:
+    def _on_action(self, action: str):
+        """Handle quick action buttons"""
+        if action == "clear":
+            self.logs_view.clear()
+            self.alerts_view.clear()
+        elif action == "analyze":
+            self.stack.set_visible_child_name("chat")
+            self._on_chat_send("Analyze recent security alerts and provide a threat assessment.")
+        elif action == "emergency":
+            self.stack.set_visible_child_name("chat")
+            self._on_chat_send("EMERGENCY: Provide immediate incident response checklist for a potential security breach.")
+        elif action == "suricata":
+            self.stack.set_visible_child_name("suricata")
+        elif action == "status":
+            # Show stats
+            pass
+        elif action == "refresh":
             pass
 
-    @on(Input.Submitted, "#chat-input")
-    async def handle_chat_submit(self, event: Input.Submitted) -> None:
-        """Handle enter key in chat input"""
-        await self.handle_chat_send()
+    def _on_chat_send(self, message: str):
+        """Handle chat messages"""
+        if not HAS_AIOHTTP:
+            self.chat.add_message("System", "aiohttp not available for LLM chat", is_user=False)
+            return
 
-    @on(Button.Pressed, "#btn-analyze")
-    async def handle_analyze(self) -> None:
-        """Analyze recent threats with LLM"""
+        threading.Thread(
+            target=self._call_ollama,
+            args=(message,),
+            daemon=True
+        ).start()
+
+    def _call_ollama(self, prompt: str):
+        """Call Ollama API in background thread"""
+        import requests
+
+        system_prompt = """You are a SOC (Security Operations Center) AI assistant.
+You help security analysts understand log events, identify threats, and respond to incidents.
+Be concise but thorough. Suggest actionable next steps when relevant."""
+
         try:
-            chat_panel = self.query_one("#chat-panel", ChatPanel)
-            await chat_panel.send_message(
-                "Analyze the recent security alerts and provide a threat assessment summary."
+            response = requests.post(
+                "http://localhost:11434/api/chat",
+                json={
+                    "model": "llama3.2:3b",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": False,
+                    "options": {"temperature": 0.7, "num_predict": 500}
+                },
+                timeout=30
             )
-            self.query_one(TabbedContent).active = "tab-chat"
-        except NoMatches:
-            pass
 
-    @on(Button.Pressed, "#btn-suricata")
-    async def handle_suricata_check(self) -> None:
-        """Check Suricata status"""
-        self.query_one(TabbedContent).active = "tab-suricata"
+            if response.status_code == 200:
+                data = response.json()
+                msg = data.get("message", {}).get("content", "No response")
+                GLib.idle_add(self.chat.add_message, "AI", msg, False)
+            else:
+                GLib.idle_add(self.chat.add_message, "Error", f"API error: {response.status_code}", False)
 
-    @on(Button.Pressed, "#btn-test")
-    async def handle_test_alert(self) -> None:
-        """Generate a test alert"""
-        event = LogEvent(
-            timestamp=datetime.now().isoformat(),
-            source="test",
-            message="🧪 Test alert generated by user",
-            severity=Severity.HIGH
+        except Exception as e:
+            GLib.idle_add(self.chat.add_message, "Error", str(e), False)
+
+
+class SwissMonitorApp(Adw.Application):
+    """Main application"""
+
+    def __init__(self):
+        super().__init__(
+            application_id="com.voidnxsec.swiss-monitor",
+            flags=Gio.ApplicationFlags.FLAGS_NONE
         )
-        try:
-            alerts_panel = self.query_one("#alerts-panel", AlertsPanel)
-            alerts_panel.add_alert(event)
-        except NoMatches:
-            pass
 
-    @on(Button.Pressed, "#btn-emergency")
-    async def handle_emergency(self) -> None:
-        """Emergency mode"""
-        try:
-            chat_panel = self.query_one("#chat-panel", ChatPanel)
-            await chat_panel.send_message(
-                "EMERGENCY: Provide immediate incident response checklist for a potential security breach."
-            )
-            self.query_one(TabbedContent).active = "tab-chat"
-        except NoMatches:
-            pass
-
-    def action_focus_logs(self) -> None:
-        self.query_one(TabbedContent).active = "tab-dashboard"
-
-    def action_focus_alerts(self) -> None:
-        self.query_one(TabbedContent).active = "tab-dashboard"
-
-    def action_focus_chat(self) -> None:
-        self.query_one(TabbedContent).active = "tab-chat"
-
-    def action_emergency(self) -> None:
-        asyncio.create_task(self.handle_emergency())
-
-    def action_refresh(self) -> None:
-        self.refresh()
-
-    def action_clear_logs(self) -> None:
-        try:
-            self.query_one("#logs-stream", RichLog).clear()
-        except NoMatches:
-            pass
+    def do_activate(self):
+        win = SwissMonitorWindow(self)
+        win.present()
 
 
 def main():
     app = SwissMonitorApp()
-    app.run()
+    app.run(sys.argv)
 
 
 if __name__ == "__main__":
