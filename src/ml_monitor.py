@@ -562,7 +562,7 @@ Be concise but thorough. Suggest actionable next steps when relevant."""
             response = requests.post(
                 "http://localhost:11434/api/chat",
                 json={
-                    "model": "llama3.2:3b",
+                    "model": "qwen2.5-coder:7b-instruct",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}

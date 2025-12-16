@@ -11,6 +11,11 @@ A GTK4/libappindicator-based systray that:
 Works with Hyprland/Waybar via StatusNotifierItem protocol.
 """
 
+import warnings
+
+# Suppress annoying deprecation warnings from AppIndicator3
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('AppIndicator3', '0.1')
