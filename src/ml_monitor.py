@@ -6,7 +6,7 @@ A professional GTK4/Adwaita application for real-time security monitoring:
 - Native Wayland integration
 - Glassmorphism styling with libadwaita
 - Real-time log streaming from journald, Suricata, FIM
-- LLM chat for emergency assistance (Ollama)
+- LLM chat for emergency assistance (llama.cpp turbo)
 - System tray integration
 
 Run: swiss-monitor
@@ -545,38 +545,46 @@ class SwissMonitorWindow(Adw.ApplicationWindow):
             return
 
         threading.Thread(
-            target=self._call_ollama,
+            target=self._call_llm,
             args=(message,),
             daemon=True
         ).start()
 
-    def _call_ollama(self, prompt: str):
-        """Call Ollama API in background thread"""
+    def _call_llm(self, prompt: str):
+        """Call llama.cpp API in background thread (OpenAI-compatible)"""
         import requests
+        import os
 
         system_prompt = """You are a SOC (Security Operations Center) AI assistant.
 You help security analysts understand log events, identify threats, and respond to incidents.
 Be concise but thorough. Suggest actionable next steps when relevant."""
 
+        llm_url = os.getenv("LLAMACPP_URL", "http://localhost:8080")
+
         try:
             response = requests.post(
-                "http://localhost:11434/api/chat",
+                f"{llm_url}/v1/chat/completions",
                 json={
-                    "model": "qwen2.5-coder:7b-instruct",
+                    "model": "default",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    "stream": False,
-                    "options": {"temperature": 0.7, "num_predict": 500}
+                    "temperature": 0.7,
+                    "max_tokens": 500,
+                    "stream": False
                 },
-                timeout=30
+                timeout=60
             )
 
             if response.status_code == 200:
                 data = response.json()
-                msg = data.get("message", {}).get("content", "No response")
-                GLib.idle_add(self.chat.add_message, "AI", msg, False)
+                choices = data.get("choices", [])
+                if choices:
+                    msg = choices[0].get("message", {}).get("content", "No response")
+                    GLib.idle_add(self.chat.add_message, "AI", msg, False)
+                else:
+                    GLib.idle_add(self.chat.add_message, "Error", "No response from LLM", False)
             else:
                 GLib.idle_add(self.chat.add_message, "Error", f"API error: {response.status_code}", False)
 
