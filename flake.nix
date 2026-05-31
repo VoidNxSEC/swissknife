@@ -118,7 +118,7 @@
           installPhase = ''
             mkdir -p $out/bin $out/share/swiss-systray
             cp systray.py $out/share/swiss-systray/
-            
+
             cat > $out/bin/swiss-systray << EOF
             #!${pkgs.bash}/bin/bash
             exec ${pythonEnv}/bin/python $out/share/swiss-systray/systray.py "\$@"
@@ -168,7 +168,7 @@
 
             # Network analysis
             tcpdump                # Packet analyzer (CLI)
-            wireshark              # Protocol analyzer (GUI)
+            #wireshark              # Protocol analyzer (GUI)
             tshark                 # Protocol analyzer (CLI)
           ];
           pathsToLink = [ "/bin" "/share" ];
